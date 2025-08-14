@@ -1,0 +1,1153 @@
+// src/server.js
+require('dotenv').config();
+const express = require('express');
+const session = require('express-session');
+const bcrypt = require('bcryptjs');
+
+const {
+  sequelize,
+  Employee,
+  Project,
+  Task,
+  Resource,
+  Assignment,
+  Material,
+  MaterialTransaction,
+} = require('./models');
+
+const app = express();
+const PORT = process.env.PORT || 4000;
+
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
+app.use(
+  session({
+    secret: process.env.SESSION_SECRET || 'dev-secret',
+    resave: false,
+    saveUninitialized: false,
+  })
+);
+
+/* =========================================
+   FIX: drop leftover *_backup tables (SQLite)
+   ========================================= */
+async function cleanupSQLiteAlterArtifacts(sequelizeInstance) {
+  if (sequelizeInstance.getDialect() !== 'sqlite') return;
+  const [tables] = await sequelizeInstance.query(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%_backup';"
+  );
+  for (const t of tables) {
+    try {
+      await sequelizeInstance.query(`DROP TABLE IF EXISTS "${t.name}";`);
+      console.log(`Dropped leftover backup table: ${t.name}`);
+    } catch (e) {
+      console.warn(`Could not drop ${t.name}:`, e.message);
+    }
+  }
+}
+
+/* ========= Helpers (auth) ========= */
+function requireAuth(req, res, next) {
+  if (req.session.userId) return next();
+  return res.redirect('/login');
+}
+async function currentUser(req) {
+  if (!req.session.userId) return null;
+  return await Employee.findByPk(req.session.userId);
+}
+// Protect write/create routes
+[
+  '/projects/new','/projects',
+  '/employees/new','/employees',
+  '/tasks/new','/tasks',
+  '/resources/new','/resources',
+  '/assignments/new','/assignments',
+  '/materials/new','/materials',
+  '/materials/tx/new','/materials/tx'
+].forEach((p) => app.use(p, requireAuth));
+
+/* ========= Auth routes ========= */
+app.get('/login', (req, res) => {
+  res.send(`
+    <h2>Login</h2>
+    <form method="POST" action="/login">
+      <div><label>Email: <input name="email" type="email" required></label></div>
+      <div><label>Password: <input name="password" type="password" required></label></div>
+      <button type="submit">Sign in</button>
+    </form>
+    <p><a href="/">Back</a></p>
+  `);
+});
+
+app.post('/login', async (req, res) => {
+  const { email, password } = req.body;
+  const user = await Employee.findOne({ where: { email } });
+  if (!user || !user.password_hash) return res.status(401).send('Invalid credentials. <a href="/login">Try again</a>');
+  const ok = await bcrypt.compare(password, user.password_hash);
+  if (!ok) return res.status(401).send('Invalid credentials. <a href="/login">Try again</a>');
+  req.session.userId = user.id;
+  res.redirect('/');
+});
+
+app.post('/logout', (req, res) => {
+  req.session.destroy(() => res.redirect('/'));
+});
+
+/* =========================
+   Home (Embedded Dashboard)
+   ========================= */
+app.get('/', async (req, res) => {
+  const me = await currentUser(req);
+
+  // Summary counts
+  const [totalProjects, totalEmployees, totalTasks, totalResources, totalMaterials] = await Promise.all([
+    Project.count(),
+    Employee.count(),
+    Task.count(),
+    Resource.count(),
+    Material.count(),
+  ]);
+
+  // Task status chart data
+  const taskStatusCounts = await Task.findAll({
+    attributes: ['status', [sequelize.fn('COUNT', sequelize.col('status')), 'count']],
+    group: ['status'],
+  });
+  const statusLabels = taskStatusCounts.map((t) => t.status || 'unknown');
+  const statusValues = taskStatusCounts.map((t) => Number(t.dataValues.count));
+
+  // Resource utilization
+  const resources = await Resource.findAll({ include: [{ model: Assignment, as: 'assignments' }] });
+  const utilRows = resources.map((r) => {
+    const assigned = (r.assignments || []).reduce((s, a) => s + Number(a.hours || 0), 0);
+    const cap = Number(r.capacity_hours_per_week || 0);
+    const util = cap > 0 ? Math.min(100, Math.round((assigned / cap) * 100)) : 0;
+    return { name: r.name, assigned, cap, util };
+  });
+  const utilLabels = utilRows.map((r) => r.name);
+  const utilValues = utilRows.map((r) => r.util);
+
+  // Low stock alerts (materials)
+  const materials = await Material.findAll();
+  const lowStock = materials.filter((m) => Number(m.quantity_on_hand || 0) <= Number(m.reorder_level || 0));
+  const lowRows =
+    lowStock.length > 0
+      ? lowStock
+          .slice(0, 8)
+          .map(
+            (m) =>
+              `<li><strong>${m.name}</strong> — ${m.quantity_on_hand} ${m.unit} (reorder at ${m.reorder_level})</li>`
+          )
+          .join('')
+      : '<li><em>No low-stock items</em></li>';
+
+  // Util table (top 5)
+  const utilTableRows =
+    utilRows.length > 0
+      ? utilRows
+          .sort((a, b) => b.util - a.util)
+          .slice(0, 5)
+          .map((r) => `<tr><td>${r.name}</td><td>${r.assigned}</td><td>${r.cap}</td><td>${r.util}%</td></tr>`)
+          .join('')
+      : '<tr><td colspan="4"><em>No resources yet</em></td></tr>';
+
+  res.send(`
+    <h1>PM Tool (SQLite)</h1>
+    <p>
+      ${me ? `Logged in as <strong>${me.name}</strong> (${me.role})
+        <form method="POST" action="/logout" style="display:inline;margin-left:8px;">
+          <button type="submit">Logout</button>
+        </form>` : `<a href="/login">Login</a>`}
+    </p>
+
+    <h3>Dashboard</h3>
+    <ul>
+      <li>Total Projects: <strong>${totalProjects}</strong></li>
+      <li>Total Employees: <strong>${totalEmployees}</strong></li>
+      <li>Total Tasks: <strong>${totalTasks}</strong></li>
+      <li>Total Resources: <strong>${totalResources}</strong></li>
+      <li>Total Materials: <strong>${totalMaterials}</strong></li>
+    </ul>
+
+    <div style="display:flex; gap:24px; flex-wrap:wrap;">
+      <div style="max-width:520px;">
+        <h4>Tasks by Status</h4>
+        <canvas id="statusChart" width="520" height="260"></canvas>
+      </div>
+
+      <div style="max-width:520px;">
+        <h4>Resource Utilization</h4>
+        <canvas id="utilChart" width="520" height="260"></canvas>
+      </div>
+    </div>
+
+    <div style="margin-top:12px;">
+      <h4>Top Resource Utilization</h4>
+      <table border="1" cellpadding="6" cellspacing="0">
+        <thead><tr><th>Resource</th><th>Assigned Hrs</th><th>Capacity/Wk</th><th>Util%</th></tr></thead>
+        <tbody>${utilTableRows}</tbody>
+      </table>
+    </div>
+
+    <div style="margin-top:12px;">
+      <h4>Low-stock Materials</h4>
+      <ul>${lowRows}</ul>
+      <p><a href="/materials-page">View Materials</a> | <a href="/materials/tx/new">Record Stock Movement</a></p>
+    </div>
+
+    <hr/>
+
+    <h3>Projects</h3>
+    <ul>
+      <li><a href="/projects-page">Projects Table</a></li>
+      <li><a href="/projects/new">Add Project</a></li>
+    </ul>
+
+    <h3>Employees</h3>
+    <ul>
+      <li><a href="/employees-page">Employees Table</a></li>
+      <li><a href="/employees/new">Add Employee</a></li>
+    </ul>
+
+    <h3>Tasks / WBS</h3>
+    <ul>
+      <li><a href="/tasks-page">All Tasks Table</a></li>
+      <li><a href="/tasks/new">Add Task</a></li>
+    </ul>
+
+    <h3>Resources</h3>
+    <ul>
+      <li><a href="/resources-page">Resources Table</a></li>
+      <li><a href="/resources/new">Add Resource</a></li>
+      <li><a href="/assignments/new">Assign Resource to Task</a></li>
+      <li><a href="/assignments-page">Assignments Table</a></li>
+    </ul>
+
+    <h3>Materials</h3>
+    <ul>
+      <li><a href="/materials-page">Materials Table</a></li>
+      <li><a href="/materials/new">Add Material</a></li>
+      <li><a href="/materials/tx/new">Record Stock Movement</a></li>
+      <li><a href="/materials/transactions-page">Transactions</a></li>
+    </ul>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script>
+      // Tasks by Status
+      new Chart(document.getElementById('statusChart'), {
+        type: 'pie',
+        data: {
+          labels: ${JSON.stringify(statusLabels)},
+          datasets: [{ data: ${JSON.stringify(statusValues)}, backgroundColor: ['#007bff','#ffc107','#dc3545','#28a745'] }]
+        }
+      });
+
+      // Resource Utilization
+      new Chart(document.getElementById('utilChart'), {
+        type: 'bar',
+        data: {
+          labels: ${JSON.stringify(utilLabels)},
+          datasets: [{ label: 'Utilization %', data: ${JSON.stringify(utilValues)} }]
+        },
+        options: { scales: { y: { min: 0, max: 100 } } }
+      });
+    </script>
+  `);
+});
+
+/* ==============
+   Full Dashboard
+   ============== */
+app.get('/dashboard', async (req, res) => {
+  const [totalProjects, totalEmployees, totalTasks, totalResources, totalMaterials] = await Promise.all([
+    Project.count(), Employee.count(), Task.count(), Resource.count(), Material.count()
+  ]);
+
+  const taskStatusCounts = await Task.findAll({
+    attributes: ['status', [sequelize.fn('COUNT', sequelize.col('status')), 'count']],
+    group: ['status'],
+  });
+  const statusLabels = taskStatusCounts.map((t) => t.status || 'unknown');
+  const statusValues = taskStatusCounts.map((t) => Number(t.dataValues.count));
+
+  const resources = await Resource.findAll({ include: [{ model: Assignment, as: 'assignments' }] });
+  const utilLabels = resources.map((r) => r.name);
+  const utilValues = resources.map((r) => {
+    const assigned = (r.assignments || []).reduce((s, a) => s + Number(a.hours || 0), 0);
+    const cap = Number(r.capacity_hours_per_week || 0);
+    return cap > 0 ? Math.min(100, Math.round((assigned / cap) * 100)) : 0;
+  });
+
+  const materials = await Material.findAll();
+  const lowStock = materials.filter((m) => Number(m.quantity_on_hand || 0) <= Number(m.reorder_level || 0));
+  const lowList = lowStock.map((m) => `${m.name} (${m.quantity_on_hand}/${m.reorder_level})`).join(', ') || 'None';
+
+  res.send(`
+    <h1>Dashboard</h1>
+    <p><a href="/">Home</a></p>
+
+    <ul>
+      <li>Total Projects: ${totalProjects}</li>
+      <li>Total Employees: ${totalEmployees}</li>
+      <li>Total Tasks: ${totalTasks}</li>
+      <li>Total Resources: ${totalResources}</li>
+      <li>Total Materials: ${totalMaterials}</li>
+      <li><strong>Low-stock:</strong> ${lowList}</li>
+    </ul>
+
+    <h3>Charts</h3>
+    <div style="max-width:520px;"><canvas id="statusChart" width="520" height="260"></canvas></div>
+    <div style="max-width:520px;"><canvas id="utilChart" width="520" height="260"></canvas></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script>
+      new Chart(document.getElementById('statusChart'), {
+        type: 'pie',
+        data: { labels: ${JSON.stringify(statusLabels)}, datasets: [{ data: ${JSON.stringify(statusValues)} }] }
+      });
+      new Chart(document.getElementById('utilChart'), {
+        type: 'bar',
+        data: { labels: ${JSON.stringify(utilLabels)}, datasets: [{ data: ${JSON.stringify(utilValues)}, label: 'Utilization %' }] },
+        options: { scales: { y: { min: 0, max: 100 } } }
+      });
+    </script>
+  `);
+});
+
+/* ================================
+   Dev helper: one-click sample seed
+   ================================ */
+app.get('/dev/seed', async (req, res) => {
+  try {
+    await Employee.findOrCreate({
+      where: { email: 'admin@company.com' },
+      defaults: { name: 'System Admin', role: 'admin', password_hash: await bcrypt.hash('admin123', 10) },
+    });
+
+    const [pm] = await Employee.findOrCreate({
+      where: { email: 'amit@company.com' },
+      defaults: { name: 'Amit Kumar', role: 'pm', phone: '050-111-2222', password_hash: await bcrypt.hash('pm123', 10) },
+    });
+
+    const [proj] = await Project.findOrCreate({
+      where: { code: 'P-001' },
+      defaults: { name: 'Demo Project', client: 'Test Client', budget: 500000, project_manager_id: pm.id },
+    });
+
+    const [task] = await Task.findOrCreate({
+      where: { name: 'Mobilization', project_id: proj.id },
+      defaults: { wbs: '1.1', start: '2025-08-10', finish: '2025-08-15', percent_complete: 100, status: 'done', owner_id: pm.id },
+    });
+
+    const [res1] = await Resource.findOrCreate({
+      where: { name: 'Crew A' },
+      defaults: { type: 'labor', rate: 20, capacity_hours_per_week: 40 },
+    });
+
+    await Assignment.findOrCreate({
+      where: { task_id: task.id, resource_id: res1.id },
+      defaults: { hours: 24 },
+    });
+
+    const [mat1] = await Material.findOrCreate({
+      where: { name: 'Cement' },
+      defaults: { unit: 'bag', unit_cost: 4.5, quantity_on_hand: 120, reorder_level: 50, is_active: true },
+    });
+    const [mat2] = await Material.findOrCreate({
+      where: { name: 'Steel Rods' },
+      defaults: { unit: 'ton', unit_cost: 520, quantity_on_hand: 2, reorder_level: 5, is_active: true },
+    });
+
+    await MaterialTransaction.findOrCreate({
+      where: { material_id: mat1.id, type: 'receive', quantity: 100, note: 'Initial stock' },
+      defaults: { date: new Date().toISOString().slice(0,10) }
+    });
+    await MaterialTransaction.findOrCreate({
+      where: { material_id: mat2.id, type: 'receive', quantity: 2, note: 'Initial stock' },
+      defaults: { date: new Date().toISOString().slice(0,10) }
+    });
+
+    res.send('Seeded Admin, PM, Project, Task, Resource, Assignment, Materials. <a href="/">Go Home</a>');
+  } catch (e) {
+    res.status(500).send('Seed error: ' + e.message);
+  }
+});
+
+/* ============ EMPLOYEES ============ */
+app.get('/employees', async (req, res) => res.json(await Employee.findAll()));
+
+app.get('/employees-page', async (req, res) => {
+  const list = await Employee.findAll();
+  const rows = list.map(e => `
+      <tr>
+        <td>${e.id}</td><td>${e.name}</td><td>${e.email}</td><td>${e.role}</td><td>${e.phone || ''}</td>
+        <td>
+          <a href="/employees/${e.id}/edit">Edit</a>
+          <form method="POST" action="/employees/${e.id}/delete" style="display:inline" onsubmit="return confirm('Delete this employee?');">
+            <button type="submit">Delete</button>
+          </form>
+        </td>
+      </tr>
+  `).join('');
+  res.send(`
+    <h2>Employees</h2>
+    <p><a href="/">Home</a> | <a href="/employees/new">Add Employee</a></p>
+    <table border="1" cellpadding="8" cellspacing="0">
+      <thead><tr><th>ID</th><th>Name</th><th>Email</th><th>Role</th><th>Phone</th><th>Actions</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `);
+});
+
+
+// Edit employee (form)
+app.get('/employees/:id/edit', async (req, res) => {
+  const e = await Employee.findByPk(req.params.id);
+  if (!e) return res.status(404).send('Employee not found');
+  res.send(`
+    <h2>Edit Employee</h2>
+    <p><a href="/employees-page">Back</a></p>
+    <form method="POST" action="/employees/${e.id}/edit">
+      <div><label>Name: <input name="name" value="${e.name}" required></label></div>
+      <div><label>Email: <input name="email" type="email" value="${e.email}" required></label></div>
+      <div><label>Role:
+        <select name="role" required>
+          ${['admin','pm','engineer','viewer'].map(r => `<option value="${r}" ${e.role===r?'selected':''}>${r}</option>`).join('')}
+        </select>
+      </label></div>
+      <div><label>Phone: <input name="phone" value="${e.phone || ''}"></label></div>
+      <div><label>New Temp Password: <input name="password" type="password" placeholder="leave blank to keep"></label></div>
+      <button type="submit">Save Changes</button>
+    </form>
+  `);
+});
+
+// Save edits
+app.post('/employees/:id/edit', async (req, res) => {
+  const e = await Employee.findByPk(req.params.id);
+  if (!e) return res.status(404).send('Employee not found');
+  const update = { name: req.body.name, email: req.body.email, role: req.body.role, phone: req.body.phone };
+  if (req.body.password) update.password_hash = await bcrypt.hash(req.body.password, 10);
+  await e.update(update);
+  res.redirect('/employees-page');
+});
+
+// Delete employee
+app.post('/employees/:id/delete', async (req, res) => {
+  const e = await Employee.findByPk(req.params.id);
+  if (!e) return res.status(404).send('Employee not found');
+  await e.destroy();
+  res.redirect('/employees-page');
+});
+
+
+/* ========= PROJECTS ========= */
+app.get('/projects', async (req, res) => {
+  res.json(await Project.findAll({ include: [{ model: Employee, as: 'projectManager' }] }));
+});
+
+app.get('/projects-page', async (req, res) => {
+  const list = await Project.findAll({ include: [{ model: Employee, as: 'projectManager' }] });
+  const rows = list
+    .map(
+      (p) => `
+    <tr>
+      <td>${p.code}</td><td>${p.name}</td><td>${p.client || ''}</td>
+      <td>${Number(p.budget).toLocaleString()}</td>
+      <td>${p.projectManager ? p.projectManager.name : '<em>Unassigned</em>'}</td>
+      <td><a href="/projects/${p.id}/tasks-page">View Tasks</a></td>
+      <td>
+        <a href="/projects/${p.id}/edit">Edit</a>
+        <form method="POST" action="/projects/${p.id}/delete" style="display:inline" onsubmit="return confirm('Delete this project?');">
+          <button type="submit">Delete</button>
+        </form>
+      </td>
+    </tr>`
+    )
+    .join('');
+  res.send(`
+    <h2>Projects</h2>
+    <p><a href="/">Home</a> | <a href="/projects/new">Add Project</a></p>
+    <table border="1" cellpadding="8" cellspacing="0"><thead><tr><th>Code</th><th>Name</th><th>Client</th><th>Budget</th><th>PM</th><th>Tasks</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table>
+  `);
+});
+
+app.get('/projects/new', async (req, res) => {
+  const pmList = await Employee.findAll(); // allow any role to be PM
+  const options = pmList.map((e) => `<option value="${e.id}">${e.name}</option>`).join('');
+  const pmBlock = pmList.length
+    ? `<select name="project_manager_id"><option value="">-- None --</option>${options}</select>`
+    : `<strong>No employees yet.</strong> <a href="/employees/new">Add one</a>`;
+  res.send(`
+    <h2>Add Project</h2>
+    <p><a href="/">Home</a> | <a href="/projects-page">Back</a></p>
+    <form method="POST" action="/projects">
+      <div><label>Code: <input name="code" required></label></div>
+      <div><label>Name: <input name="name" required></label></div>
+      <div><label>Client: <input name="client"></label></div>
+      <div><label>Budget: <input name="budget" type="number" step="0.01" value="0"></label></div>
+      <div><label>Project Manager: ${pmBlock}</label></div>
+      <button type="submit" ${pmList.length ? '' : 'disabled'}>Save</button>
+    </form>
+  `);
+});
+
+app.post('/projects', async (req, res) => {
+  try {
+    const { code, name, client, budget, project_manager_id } = req.body;
+    await Project.create({
+      code,
+      name,
+      client,
+      budget: Number(budget || 0),
+      project_manager_id: project_manager_id || null,
+    });
+    res.redirect('/projects-page');
+  } catch (err) {
+    res.status(400).send('Error: ' + err.message);
+  }
+});
+
+// Edit project
+app.get('/projects/:id/edit', async (req, res) => {
+  const p = await Project.findByPk(req.params.id);
+  if (!p) return res.status(404).send('Project not found');
+
+  const employees = await Employee.findAll();
+  const pmOptions = employees.map(e =>
+    `<option value="${e.id}" ${p.project_manager_id == e.id ? 'selected' : ''}>${e.name}</option>`
+  ).join('');
+
+  res.send(`
+    <h2>Edit Project</h2>
+    <p><a href="/projects-page">Back</a></p>
+    <form method="POST" action="/projects/${p.id}/edit">
+      <div><label>Code: <input name="code" value="${p.code}" required></label></div>
+      <div><label>Name: <input name="name" value="${p.name}" required></label></div>
+      <div><label>Client: <input name="client" value="${p.client || ''}"></label></div>
+      <div><label>Budget: <input name="budget" type="number" step="0.01" value="${p.budget || 0}"></label></div>
+      <div><label>Project Manager:
+        <select name="project_manager_id">
+          <option value="">-- None --</option>
+          ${pmOptions}
+        </select>
+      </label></div>
+      <button type="submit">Save Changes</button>
+    </form>
+  `);
+});
+
+app.post('/projects/:id/edit', async (req, res) => {
+  const p = await Project.findByPk(req.params.id);
+  if (!p) return res.status(404).send('Project not found');
+  const { code, name, client, budget, project_manager_id } = req.body;
+  await p.update({
+    code, name, client,
+    budget: Number(budget || 0),
+    project_manager_id: project_manager_id || null
+  });
+  res.redirect('/projects-page');
+});
+
+app.post('/projects/:id/delete', async (req, res) => {
+  const p = await Project.findByPk(req.params.id);
+  if (!p) return res.status(404).send('Project not found');
+  await p.destroy();
+  res.redirect('/projects-page');
+});
+
+/* ===== TASKS ===== */
+app.get('/tasks', async (req, res) => {
+  res.json(await Task.findAll({ include: [{ model: Project }, { model: Employee, as: 'owner' }] }));
+});
+
+app.get('/tasks-page', async (req, res) => {
+  const list = await Task.findAll({ include: [{ model: Project }, { model: Employee, as: 'owner' }] });
+  const rows = list
+    .map(
+      (t) => `
+    <tr>
+      <td>${t.id}</td>
+      <td>${t.Project ? t.Project.code + ' — ' + t.Project.name : ''}</td>
+      <td>${t.wbs || ''}</td>
+      <td>${t.name}</td>
+      <td>${t.owner ? t.owner.name : ''}</td>
+      <td>${t.start || ''}</td>
+      <td>${t.finish || ''}</td>
+      <td>${t.percent_complete}%</td>
+      <td>${t.status}</td>
+      <td>
+        <a href="/tasks/${t.id}/edit">Edit</a>
+        <form method="POST" action="/tasks/${t.id}/delete" style="display:inline" onsubmit="return confirm('Delete this task?');">
+          <button type="submit">Delete</button>
+        </form>
+      </td>
+    </tr>`
+    )
+    .join('');
+  res.send(`
+    <h2>All Tasks</h2>
+    <p><a href="/">Home</a> | <a href="/tasks/new">Add Task</a></p>
+    <table border="1" cellpadding="8" cellspacing="0"><thead><tr><th>ID</th><th>Project</th><th>WBS</th><th>Name</th><th>Owner</th><th>Start</th><th>Finish</th><th>% Complete</th><th>Status</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table>
+  `);
+});
+
+app.get('/projects/:id/tasks-page', async (req, res) => {
+  const proj = await Project.findByPk(req.params.id);
+  if (!proj) return res.status(404).send('Not found');
+  const list = await Task.findAll({ where: { project_id: proj.id }, include: [{ model: Employee, as: 'owner' }] });
+  const rows = list
+    .map(
+      (t) => `
+    <tr>
+      <td>${t.id}</td><td>${t.wbs || ''}</td><td>${t.name}</td>
+      <td>${t.owner ? t.owner.name : ''}</td>
+      <td>${t.start || ''}</td><td>${t.finish || ''}</td>
+      <td>${t.percent_complete}%</td><td>${t.status}</td>
+      <td>
+        <a href="/tasks/${t.id}/edit">Edit</a>
+        <form method="POST" action="/tasks/${t.id}/delete" style="display:inline" onsubmit="return confirm('Delete this task?');">
+          <button type="submit">Delete</button>
+        </form>
+      </td>
+    </tr>`
+    )
+    .join('');
+  res.send(`
+    <h2>Tasks — ${proj.code} ${proj.name}</h2>
+    <p><a href="/projects-page">Back</a> | <a href="/tasks/new?project=${proj.id}">Add Task</a></p>
+    <table border="1" cellpadding="8" cellspacing="0">
+      <thead><tr><th>ID</th><th>WBS</th><th>Name</th><th>Owner</th><th>Start</th><th>Finish</th><th>% Complete</th><th>Status</th><th>Actions</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `);
+});
+
+app.get('/tasks/new', async (req, res) => {
+  const projects = await Project.findAll();
+  const projectOptions = projects
+    .map((p) => `<option value="${p.id}" ${req.query.project == p.id ? 'selected' : ''}>${p.code} — ${p.name}</option>`)
+    .join('');
+  const owners = await Employee.findAll();
+  const ownerOptions = owners.map((e) => `<option value="${e.id}">${e.name} (${e.role})</option>`).join('');
+  res.send(`
+    <h2>Add Task</h2>
+    <p><a href="/">Home</a> | <a href="/tasks-page">Back</a></p>
+    <form method="POST" action="/tasks">
+      <div><label>Project: <select name="project_id" required>${projectOptions}</select></label></div>
+      <div><label>WBS: <input name="wbs"></label></div>
+      <div><label>Name: <input name="name" required></label></div>
+      <div><label>Owner: <select name="owner_id" required>${ownerOptions}</select></label></div>
+      <div><label>Start: <input name="start" type="date"></label></div>
+      <div><label>Finish: <input name="finish" type="date"></label></div>
+      <div><label>% Complete: <input name="percent_complete" type="number" min="0" max="100" value="0"></label></div>
+      <div>
+        <label>Status:
+          <select name="status">
+            <option value="not_started">Not started</option>
+            <option value="in_progress">In progress</option>
+            <option value="blocked">Blocked</option>
+            <option value="done">Done</option>
+          </select>
+        </label>
+      </div>
+      <button type="submit">Save</button>
+    </form>
+  `);
+});
+
+app.post('/tasks', async (req, res) => {
+  try {
+    await Task.create(req.body);
+    res.redirect('/tasks-page');
+  } catch (err) {
+    res.status(400).send('Error: ' + err.message);
+  }
+});
+
+// Edit task
+app.get('/tasks/:id/edit', async (req, res) => {
+  const t = await Task.findByPk(req.params.id);
+  if (!t) return res.status(404).send('Task not found');
+
+  const projects = await Project.findAll();
+  const projectOptions = projects.map(p =>
+    `<option value="${p.id}" ${t.project_id == p.id ? 'selected' : ''}>${p.code} — ${p.name}</option>`
+  ).join('');
+
+  const owners = await Employee.findAll();
+  const ownerOptions = owners.map(e =>
+    `<option value="${e.id}" ${t.owner_id == e.id ? 'selected' : ''}>${e.name} (${e.role})</option>`
+  ).join('');
+
+  res.send(`
+    <h2>Edit Task</h2>
+    <p><a href="/tasks-page">Back</a></p>
+    <form method="POST" action="/tasks/${t.id}/edit">
+      <div><label>Project: <select name="project_id" required>${projectOptions}</select></label></div>
+      <div><label>WBS: <input name="wbs" value="${t.wbs || ''}"></label></div>
+      <div><label>Name: <input name="name" value="${t.name}" required></label></div>
+      <div><label>Owner: <select name="owner_id" required>${ownerOptions}</select></label></div>
+      <div><label>Start: <input name="start" type="date" value="${t.start || ''}"></label></div>
+      <div><label>Finish: <input name="finish" type="date" value="${t.finish || ''}"></label></div>
+      <div><label>% Complete: <input name="percent_complete" type="number" min="0" max="100" value="${t.percent_complete || 0}"></label></div>
+      <div><label>Status:
+        <select name="status">
+          <option value="not_started" ${t.status==='not_started'?'selected':''}>Not started</option>
+          <option value="in_progress" ${t.status==='in_progress'?'selected':''}>In progress</option>
+          <option value="blocked" ${t.status==='blocked'?'selected':''}>Blocked</option>
+          <option value="done" ${t.status==='done'?'selected':''}>Done</option>
+        </select>
+      </label></div>
+      <button type="submit">Save Changes</button>
+    </form>
+  `);
+});
+
+app.post('/tasks/:id/edit', async (req, res) => {
+  const t = await Task.findByPk(req.params.id);
+  if (!t) return res.status(404).send('Task not found');
+  await t.update({
+    project_id: req.body.project_id,
+    wbs: req.body.wbs,
+    name: req.body.name,
+    owner_id: req.body.owner_id,
+    start: req.body.start || null,
+    finish: req.body.finish || null,
+    percent_complete: Number(req.body.percent_complete || 0),
+    status: req.body.status
+  });
+  res.redirect('/tasks-page');
+});
+
+app.post('/tasks/:id/delete', async (req, res) => {
+  const t = await Task.findByPk(req.params.id);
+  if (!t) return res.status(404).send('Task not found');
+  await t.destroy();
+  res.redirect('/tasks-page');
+});
+
+/* ============ RESOURCES ============ */
+app.get('/resources', async (req, res) => res.json(await Resource.findAll()));
+
+app.get('/resources-page', async (req, res) => {
+  const list = await Resource.findAll();
+  const rows = list
+    .map(
+      (r) => `
+    <tr>
+      <td>${r.id}</td><td>${r.name}</td><td>${r.type}</td><td>${Number(r.rate).toLocaleString()}</td>
+      <td>${r.capacity_hours_per_week}</td><td>${r.is_active ? 'Yes' : 'No'}</td>
+      <td>
+        <a href="/resources/${r.id}/edit">Edit</a>
+        <form method="POST" action="/resources/${r.id}/delete" style="display:inline" onsubmit="return confirm('Delete this resource?');">
+          <button type="submit">Delete</button>
+        </form>
+      </td>
+    </tr>`
+    )
+    .join('');
+  res.send(`
+    <h2>Resources</h2>
+    <p><a href="/">Home</a> | <a href="/resources/new">Add Resource</a></p>
+    <table border="1" cellpadding="8" cellspacing="0">
+      <thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Rate</th><th>Capacity/Wk</th><th>Active</th><th>Actions</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `);
+});
+
+
+// Edit resource (form)
+app.get('/resources/:id/edit', async (req, res) => {
+  const r = await Resource.findByPk(req.params.id);
+  if (!r) return res.status(404).send('Resource not found');
+  res.send(`
+    <h2>Edit Resource</h2>
+    <p><a href="/resources-page">Back</a></p>
+    <form method="POST" action="/resources/${r.id}/edit">
+      <div><label>Name: <input name="name" value="${r.name}" required></label></div>
+      <div><label>Type:
+        <select name="type" required>
+          <option value="labor" ${r.type==='labor'?'selected':''}>Labor</option>
+          <option value="equipment" ${r.type==='equipment'?'selected':''}>Equipment</option>
+        </select>
+      </label></div>
+      <div><label>Rate: <input name="rate" type="number" step="0.01" value="${r.rate || 0}"></label></div>
+      <div><label>Capacity Hours/Week: <input name="capacity_hours_per_week" type="number" value="${r.capacity_hours_per_week || 0}"></label></div>
+      <div><label>Active: <input name="is_active" type="checkbox" ${r.is_active ? 'checked' : ''}></label></div>
+      <button type="submit">Save Changes</button>
+    </form>
+  `);
+});
+
+// Save edits
+app.post('/resources/:id/edit', async (req, res) => {
+  const r = await Resource.findByPk(req.params.id);
+  if (!r) return res.status(404).send('Resource not found');
+  await r.update({
+    name: req.body.name,
+    type: req.body.type || 'labor',
+    rate: Number(req.body.rate || 0),
+    capacity_hours_per_week: Number(req.body.capacity_hours_per_week || 0),
+    is_active: !!req.body.is_active,
+  });
+  res.redirect('/resources-page');
+});
+
+// Delete resource
+app.post('/resources/:id/delete', async (req, res) => {
+  const r = await Resource.findByPk(req.params.id);
+  if (!r) return res.status(404).send('Resource not found');
+  await r.destroy();
+  res.redirect('/resources-page');
+});
+
+
+/* =============== ASSIGNMENTS =============== */
+app.get('/assignments', async (req, res) => {
+  const list = await Assignment.findAll({
+    include: [
+      { model: Task, as: 'task', include: [Project] },
+      { model: Resource, as: 'resource' },
+    ],
+  });
+  res.json(list);
+});
+
+app.get('/assignments-page', async (req, res) => {
+  const list = await Assignment.findAll({
+    include: [
+      { model: Task, as: 'task', include: [Project] },
+      { model: Resource, as: 'resource' },
+    ],
+  });
+
+  const rows = list
+    .map((a) => {
+      const proj = a.task?.Project;
+      return `
+      <tr>
+        <td>${a.id}</td>
+        <td>${proj ? proj.code : ''} ${proj ? '— ' + proj.name : ''}</td>
+        <td>${a.task ? a.task.name : ''}</td>
+        <td>${a.resource ? a.resource.name : ''}</td>
+        <td>${a.hours}</td>
+      </tr>`;
+    })
+    .join('');
+
+  res.send(`
+    <h2>Assignments</h2>
+    <p><a href="/">Home</a> | <a href="/assignments/new">Assign Resource to Task</a></p>
+    <table border="1" cellpadding="8" cellspacing="0">
+      <thead><tr><th>ID</th><th>Project</th><th>Task</th><th>Resource</th><th>Hours</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `);
+});
+
+app.get('/assignments/new', async (req, res) => {
+  const tasks = await Task.findAll({ include: [Project] });
+  const taskOptions = tasks
+    .map((t) => `<option value="${t.id}">${t.Project ? t.Project.code + ' — ' + t.Project.name : ''} — ${t.name}</option>`)
+    .join('');
+  const resources = await Resource.findAll();
+  const resourceOptions = resources.map((r) => `<option value="${r.id}">${r.name} (${r.type})</option>`).join('');
+
+  res.send(`
+    <h2>Assign Resource to Task</h2>
+    <p><a href="/">Home</a> | <a href="/assignments-page">Back</a></p>
+    <form method="POST" action="/assignments">
+      <div><label>Task: <select name="task_id" required>${taskOptions}</select></label></div>
+      <div><label>Resource: <select name="resource_id" required>${resourceOptions}</select></label></div>
+      <div><label>Hours: <input name="hours" type="number" step="0.25" value="8"></label></div>
+      <button type="submit">Save</button>
+    </form>
+  `);
+});
+
+app.post('/assignments', async (req, res) => {
+  try {
+    await Assignment.create({
+      task_id: req.body.task_id,
+      resource_id: req.body.resource_id,
+      hours: Number(req.body.hours || 0),
+    });
+    res.redirect('/assignments-page');
+  } catch (err) {
+    res.status(400).send('Error: ' + err.message);
+  }
+});
+
+/* ================= MATERIALS ================= */
+app.get('/materials', async (req, res) => res.json(await Material.findAll()));
+
+app.get('/materials-page', async (req, res) => {
+  const list = await Material.findAll();
+  const rows = list
+    .map(
+      (m) => `
+    <tr>
+      <td>${m.id}</td><td>${m.name}</td><td>${m.unit}</td>
+      <td>${Number(m.unit_cost).toLocaleString()}</td>
+      <td>${Number(m.quantity_on_hand)}</td>
+      <td>${Number(m.reorder_level)}</td>
+      <td>${Number(m.quantity_on_hand) <= Number(m.reorder_level) ? '<span style="color:red;">LOW</span>' : 'OK'}</td>
+      <td>
+        <a href="/materials/${m.id}/edit">Edit</a>
+        <form method="POST" action="/materials/${m.id}/delete" style="display:inline" onsubmit="return confirm('Delete this material?');">
+          <button type="submit">Delete</button>
+        </form>
+        <a href="/materials/tx/new?material=${m.id}" style="margin-left:8px;">Record Movement</a>
+      </td>
+    </tr>`
+    )
+    .join('');
+  res.send(`
+    <h2>Materials</h2>
+    <p>
+      <a href="/">Home</a> |
+      <a href="/materials/new">Add Material</a> |
+      <a href="/materials/tx/new">Record Movement</a> |
+      <a href="/materials/transactions-page">Transactions</a>
+    </p>
+    <table border="1" cellpadding="8" cellspacing="0">
+      <thead><tr><th>ID</th><th>Name</th><th>Unit</th><th>Unit Cost</th><th>On Hand</th><th>Reorder</th><th>Status</th><th>Actions</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `);
+});
+
+
+// Edit material (form)
+app.get('/materials/:id/edit', async (req, res) => {
+  const m = await Material.findByPk(req.params.id);
+  if (!m) return res.status(404).send('Material not found');
+  res.send(`
+    <h2>Edit Material</h2>
+    <p><a href="/materials-page">Back</a></p>
+    <form method="POST" action="/materials/${m.id}/edit">
+      <div><label>Name: <input name="name" value="${m.name}" required></label></div>
+      <div><label>Unit: <input name="unit" value="${m.unit || 'unit'}"></label></div>
+      <div><label>Unit Cost: <input name="unit_cost" type="number" step="0.01" value="${m.unit_cost || 0}"></label></div>
+      <div><label>Quantity on Hand: <input name="quantity_on_hand" type="number" step="0.01" value="${m.quantity_on_hand || 0}"></label></div>
+      <div><label>Reorder Level: <input name="reorder_level" type="number" step="0.01" value="${m.reorder_level || 0}"></label></div>
+      <div><label>Active: <input name="is_active" type="checkbox" ${m.is_active ? 'checked' : ''}></label></div>
+      <button type="submit">Save Changes</button>
+    </form>
+  `);
+});
+
+// Save edits
+app.post('/materials/:id/edit', async (req, res) => {
+  const m = await Material.findByPk(req.params.id);
+  if (!m) return res.status(404).send('Material not found');
+  await m.update({
+    name: req.body.name,
+    unit: req.body.unit || 'unit',
+    unit_cost: Number(req.body.unit_cost || 0),
+    quantity_on_hand: Number(req.body.quantity_on_hand || 0),
+    reorder_level: Number(req.body.reorder_level || 0),
+    is_active: !!req.body.is_active,
+  });
+  res.redirect('/materials-page');
+});
+
+// Delete material
+app.post('/materials/:id/delete', async (req, res) => {
+  const m = await Material.findByPk(req.params.id);
+  if (!m) return res.status(404).send('Material not found');
+  await m.destroy();
+  res.redirect('/materials-page');
+});
+
+
+// Record stock movement
+app.get('/materials/tx/new', async (req, res) => {
+  const materials = await Material.findAll();
+  const options = materials
+    .map((m) => `<option value="${m.id}" ${req.query.material == m.id ? 'selected' : ''}>${m.name}</option>`)
+    .join('');
+  res.send(`
+    <h2>Record Stock Movement</h2>
+    <p><a href="/materials-page">Back</a></p>
+    <form method="POST" action="/materials/tx">
+      <div><label>Material: <select name="material_id" required>${options}</select></label></div>
+      <div><label>Type:
+        <select name="type" required>
+          <option value="receive">Receive (add)</option>
+          <option value="consume">Consume (subtract)</option>
+          <option value="adjust">Adjust (add/subtract)</option>
+        </select>
+      </label></div>
+      <div><label>Quantity: <input name="quantity" type="number" step="0.01" value="1" required></label></div>
+      <div><label>Date: <input name="date" type="date" value="${new Date().toISOString().slice(0,10)}"></label></div>
+      <div><label>Note: <input name="note" placeholder="optional"></label></div>
+      <button type="submit">Save</button>
+    </form>
+  `);
+});
+
+app.post('/materials/tx', async (req, res) => {
+  try {
+    const { material_id, type, quantity, date, note } = req.body;
+    const mat = await Material.findByPk(material_id);
+    if (!mat) return res.status(404).send('Material not found');
+
+    const qty = Number(quantity || 0);
+    if (!['receive', 'consume', 'adjust'].includes(type)) {
+      return res.status(400).send('Invalid type');
+    }
+    if (qty === 0) return res.status(400).send('Quantity cannot be 0');
+
+    await MaterialTransaction.create({
+      material_id: mat.id,
+      type,
+      quantity: qty,
+      date: date || new Date().toISOString().slice(0,10),
+      note: note || '',
+    });
+
+    let newQ = Number(mat.quantity_on_hand || 0);
+    if (type === 'receive') newQ += qty;
+    else if (type === 'consume') newQ -= qty;
+    else if (type === 'adjust') newQ += qty; // qty can be +/- (use negative for subtract)
+    await mat.update({ quantity_on_hand: newQ });
+
+    res.redirect('/materials-page');
+  } catch (err) {
+    res.status(400).send('Error: ' + err.message);
+  }
+});
+
+// Transactions page
+app.get('/materials/transactions-page', async (req, res) => {
+  const txs = await MaterialTransaction.findAll({ include: [{ model: Material }], order: [['createdAt','DESC']] });
+  const rows = txs
+    .map(
+      (t) => `
+    <tr>
+      <td>${t.id}</td><td>${t.Material ? t.Material.name : ''}</td><td>${t.type}</td>
+      <td>${t.quantity}</td><td>${t.date || ''}</td><td>${t.note || ''}</td>
+    </tr>`
+    )
+    .join('');
+  res.send(`
+    <h2>Material Transactions</h2>
+    <p><a href="/">Home</a> | <a href="/materials/tx/new">Record Movement</a> | <a href="/materials-page">Materials</a></p>
+    <table border="1" cellpadding="8" cellspacing="0">
+      <thead><tr><th>ID</th><th>Material</th><th>Type</th><th>Qty</th><th>Date</th><th>Note</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `);
+});
+
+/* ===========================
+   Start server with auto-seed
+   =========================== */
+(async () => {
+  const isSQLite = sequelize.getDialect() === 'sqlite';
+
+  // Helper: drop leftover *_backup tables created by previous failed alter() runs
+  async function cleanupSQLiteAlterArtifacts(sequelizeInstance) {
+    if (!isSQLite) return;
+    const [tables] = await sequelizeInstance.query(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%_backup';"
+    );
+    for (const t of tables) {
+      try {
+        await sequelizeInstance.query(`DROP TABLE IF EXISTS "${t.name}";`);
+        console.log(`Dropped leftover backup table: ${t.name}`);
+      } catch (e) {
+        console.warn(`Could not drop ${t.name}:`, e.message);
+      }
+    }
+  }
+
+  // 1) TEMPORARILY disable foreign-keys so SQLite allows table changes during alter()
+  if (isSQLite) {
+    await sequelize.query('PRAGMA foreign_keys = OFF;');
+    console.log('SQLite foreign_keys = OFF (during alter)');
+  }
+
+  try {
+    // 2) Clean up any stale backup tables from previous attempts
+    await cleanupSQLiteAlterArtifacts(sequelize);
+
+    // 3) Sync models (dev-friendly alter)
+    await sequelize.sync({ alter: true });
+
+  } finally {
+    // 4) Re-enable foreign keys even if something throws
+    if (isSQLite) {
+      await sequelize.query('PRAGMA foreign_keys = ON;');
+      console.log('SQLite foreign_keys = ON');
+    }
+  }
+
+  // 5) Seed baseline data (idempotent)
+  const [empCount, projCount, taskCount, resCount, matCount] = await Promise.all([
+    Employee.count(), Project.count(), Task.count(), Resource.count(), Material.count()
+  ]);
+
+  const adminEmail = process.env.ADMIN_EMAIL || 'admin@company.com';
+  const adminPass  = process.env.ADMIN_PASSWORD || 'admin123';
+  await Employee.findOrCreate({
+    where: { email: adminEmail },
+    defaults: { name: 'System Admin', role: 'admin', password_hash: await bcrypt.hash(adminPass, 10) }
+  });
+
+  if (empCount === 0 || projCount === 0 || taskCount === 0 || resCount === 0 || matCount === 0) {
+    console.log('Seeding sample data (idempotent)...');
+
+    const [pm] = await Employee.findOrCreate({
+      where: { email: 'amit@company.com' },
+      defaults: { name: 'Amit Kumar', role: 'pm', phone: '050-111-2222', password_hash: await bcrypt.hash('pm123', 10) },
+    });
+
+    const [proj] = await Project.findOrCreate({
+      where: { code: 'P-001' },
+      defaults: { name: 'Demo Project', client: 'Test Client', budget: 500000, project_manager_id: pm.id },
+    });
+
+    const [task] = await Task.findOrCreate({
+      where: { name: 'Mobilization', project_id: proj.id },
+      defaults: { wbs: '1.1', start: '2025-08-10', finish: '2025-08-15', percent_complete: 100, status: 'done', owner_id: pm.id },
+    });
+
+    const [res1] = await Resource.findOrCreate({
+      where: { name: 'Crew A' },
+      defaults: { type: 'labor', rate: 20, capacity_hours_per_week: 40 },
+    });
+
+    await Assignment.findOrCreate({
+      where: { task_id: task.id, resource_id: res1.id },
+      defaults: { hours: 24 },
+    });
+
+    const [mat1] = await Material.findOrCreate({
+      where: { name: 'Cement' },
+      defaults: { unit: 'bag', unit_cost: 4.5, quantity_on_hand: 120, reorder_level: 50, is_active: true },
+    });
+    const [mat2] = await Material.findOrCreate({
+      where: { name: 'Steel Rods' },
+      defaults: { unit: 'ton', unit_cost: 520, quantity_on_hand: 2, reorder_level: 5, is_active: true },
+    });
+
+    await MaterialTransaction.findOrCreate({
+      where: { material_id: mat1.id, type: 'receive', quantity: 100, note: 'Initial stock' },
+      defaults: { date: new Date().toISOString().slice(0,10) }
+    });
+    await MaterialTransaction.findOrCreate({
+      where: { material_id: mat2.id, type: 'receive', quantity: 2, note: 'Initial stock' },
+      defaults: { date: new Date().toISOString().slice(0,10) }
+    });
+
+    console.log('Sample data ensured ✅');
+  }
+
+  // 6) Start server
+  const PORT = process.env.PORT || 4000;
+  app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
+})();
